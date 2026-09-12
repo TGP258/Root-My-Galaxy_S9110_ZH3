@@ -5,6 +5,7 @@ import android.system.Os
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import org.json.JSONObject
@@ -17,21 +18,28 @@ data class VerifiedPayloads(
 
 class PayloadRepository(private val context: Context) {
     fun loadTargets(): List<TargetProfile> {
+        val remoteTargets = runCatching { loadRemoteTargets() }.getOrDefault(emptyList())
+        return localOverrides + remoteTargets
+    }
+
+    private fun loadRemoteTargets(): List<TargetProfile> {
         val commit = resolveMainCommit()
         val manifestBytes = downloadBytes(rawUrl(commit, "support/targets-v3.json"), MAX_MANIFEST_BYTES)
         return SupportManifest.parse(manifestBytes).targets.map { profile -> profile.copy(
-            exploit = profile.exploit.copy(url = pinArtifactUrl(profile.exploit.url, commit)),
-            kernelSu = profile.kernelSu.copy(url = pinArtifactUrl(profile.kernelSu.url, commit)),
+            exploit = pinArtifact(profile.exploit, commit),
+            kernelSu = pinArtifact(profile.kernelSu, commit),
         ) }
     }
 
-    fun resolveTarget(snapshot: DeviceSnapshot): TargetProfile = loadTargets()
-        .firstOrNull { it.matches(snapshot) }
-        ?: error(context.getString(R.string.repo_no_profile))
+    fun resolveTarget(snapshot: DeviceSnapshot): TargetProfile =
+        localOverrides.firstOrNull { it.matches(snapshot) }
+            ?: loadTargets().firstOrNull { it.matches(snapshot) }
+            ?: error(context.getString(R.string.repo_no_profile))
 
-    fun resolveTarget(profileId: String): TargetProfile = loadTargets()
-        .firstOrNull { it.profileId == profileId }
-        ?: error(context.getString(R.string.repo_profile_missing, profileId))
+    fun resolveTarget(profileId: String): TargetProfile =
+        localOverrides.firstOrNull { it.profileId == profileId }
+            ?: loadTargets().firstOrNull { it.profileId == profileId }
+            ?: error(context.getString(R.string.repo_profile_missing, profileId))
 
     fun download(profile: TargetProfile, onProgress: (String) -> Unit): VerifiedPayloads {
         val directory = File(context.filesDir, "payloads/${profile.profileId}").apply { mkdirs() }
@@ -60,27 +68,26 @@ class PayloadRepository(private val context: Context) {
     ): File {
         onProgress(context.getString(R.string.repo_downloading, label))
         val temporary = File(destination.parentFile, "${destination.name}.part")
-        val connection = open(artifact.url)
-        require(connection.contentLengthLong == -1L || connection.contentLengthLong == artifact.size) {
-            context.getString(R.string.repo_size_mismatch, label)
+        val bundled = artifact.asset?.let { path ->
+            runCatching { context.assets.open(path) }.getOrNull()
         }
-        var total = 0L
-        connection.inputStream.use { input ->
-            FileOutputStream(temporary).use { output ->
-                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                while (true) {
-                    val count = input.read(buffer)
-                    if (count < 0) break
-                    total += count
-                    require(total <= artifact.size) {
-                        context.getString(R.string.repo_size_exceeded, label)
-                    }
-                    output.write(buffer, 0, count)
+        val total = if (bundled != null) {
+            bundled.use { input ->
+                FileOutputStream(temporary).use { output -> copyInto(artifact, label, input, output) }
+            }
+        } else {
+            val connection = open(artifact.url)
+            try {
+                require(connection.contentLengthLong == -1L || connection.contentLengthLong == artifact.size) {
+                    context.getString(R.string.repo_size_mismatch, label)
                 }
-                output.fd.sync()
+                connection.inputStream.use { input ->
+                    FileOutputStream(temporary).use { output -> copyInto(artifact, label, input, output) }
+                }
+            } finally {
+                connection.disconnect()
             }
         }
-        connection.disconnect()
         require(total == artifact.size) { context.getString(R.string.repo_incomplete, label) }
         if (destination.exists()) destination.delete()
         require(temporary.renameTo(destination)) {
@@ -88,6 +95,25 @@ class PayloadRepository(private val context: Context) {
         }
         onProgress(context.getString(R.string.repo_verified, label))
         return destination
+    }
+
+    private fun copyInto(
+        artifact: RemoteArtifact,
+        label: String,
+        input: InputStream,
+        output: FileOutputStream,
+    ): Long {
+        var total = 0L
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            total += count
+            require(total <= artifact.size) { context.getString(R.string.repo_size_exceeded, label) }
+            output.write(buffer, 0, count)
+        }
+        output.fd.sync()
+        return total
     }
 
     private fun resolveMainCommit(): String {
@@ -101,9 +127,14 @@ class PayloadRepository(private val context: Context) {
 
     private fun rawUrl(commit: String, path: String) = "$RAW_REPOSITORY/$commit/$path"
 
-    private fun pinArtifactUrl(url: String, commit: String): String {
-        require(url.startsWith(MUTABLE_RAW_PREFIX)) { context.getString(R.string.repo_url_invalid) }
-        return "$RAW_REPOSITORY/$commit/${url.removePrefix(MUTABLE_RAW_PREFIX)}"
+    private fun pinArtifact(artifact: RemoteArtifact, commit: String): RemoteArtifact {
+        if (artifact.asset != null) return artifact
+        require(artifact.url.startsWith(MUTABLE_RAW_PREFIX)) {
+            context.getString(R.string.repo_url_invalid)
+        }
+        return artifact.copy(
+            url = "$RAW_REPOSITORY/$commit/${artifact.url.removePrefix(MUTABLE_RAW_PREFIX)}",
+        )
     }
 
     private fun downloadBytes(url: String, maximum: Int): ByteArray {
@@ -134,6 +165,25 @@ class PayloadRepository(private val context: Context) {
             connect()
             require(responseCode == HttpURLConnection.HTTP_OK) { "HTTP $responseCode" }
         }
+
+    private val localOverrides: List<TargetProfile> = listOf(
+        TargetProfile(
+            profileId = "dm1q-S9110ZCS8FZH3",
+            displayName = "Galaxy S23 (SM-S9110) | Kernel 5.15.189",
+            models = setOf("SM-S9110"),
+            kernelVersions = setOf("5.15.189"),
+            exploit = RemoteArtifact(
+                url = "$MUTABLE_RAW_PREFIX/artifacts/dm1q-S9110ZCS8FZH3/cve-2026-43499-app.so",
+                size = 104128,
+                asset = "payloads/cve-2026-43499-app.so",
+            ),
+            kernelSu = RemoteArtifact(
+                url = "$MUTABLE_RAW_PREFIX/kernelsu/ksud-dm3q-S918BXXSAFZF5-kdp",
+                size = 4879560,
+                asset = "payloads/ksud-s25u-kdp",
+            ),
+        ),
+    )
 
     companion object {
         private const val COMMIT_API_URL =

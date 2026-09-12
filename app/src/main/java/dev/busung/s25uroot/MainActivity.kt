@@ -835,6 +835,11 @@ private fun InstallStatusCard(installState: InstallUiState, onInstall: () -> Uni
                             },
                         )
                         InstallPhase.Failed -> stringResource(R.string.install_tap_retry)
+                        InstallPhase.Checking,
+                        InstallPhase.Downloading,
+                        InstallPhase.Exploiting,
+                        InstallPhase.LoadingKernelSu,
+                        -> stringResource(R.string.install_preparing)
                         else -> stringResource(R.string.install_tap_start)
                     },
                     style = MaterialTheme.typography.bodyMedium,
