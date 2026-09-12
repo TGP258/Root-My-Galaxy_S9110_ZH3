@@ -11,7 +11,7 @@ from device offsets, native exploit payloads, and KernelSU build artifacts.
 [Latest release](https://github.com/BuSung-dev/Root-My-Galaxy/releases)
 
 The device feed and native payloads are maintained in
-[Root-My-Galaxy-Payloads](https://github.com/BuSung-dev/Root-My-Galaxy-Payloads).
+[New Root-My-Galaxy-Payloads](https://github.com/TGP258/Root-My-Galaxy-Payloads_S9110_ZH3/tree/s9110_ZH3_Fix).
 
 ## Application
 
